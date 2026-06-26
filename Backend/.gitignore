@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local configuration files
+.env
+
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# Media and collected static assets
+media/
+staticfiles/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
