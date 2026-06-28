@@ -25,7 +25,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install python dependencies
 COPY requirements.txt /app/
 RUN pip install --upgrade pip
-RUN pip install -r requirements.txt
+
+# Limit C++ compilation threads to prevent Out Of Memory (OOM) errors
+ENV CMAKE_BUILD_PARALLEL_LEVEL=1
+
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy project files
 COPY . /app/
