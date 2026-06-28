@@ -89,3 +89,124 @@ class StudentResetView(APIView):
             {"message": f"Student access has been reset and unblocked successfully."},
             status=status.HTTP_200_OK
         )
+
+
+class VerifyRollNumberView(APIView):
+    """
+    Endpoint for verifying if a student exists by their roll number.
+    Returns basic profile info required for attendance verification.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        roll_number = request.data.get('roll_number')
+        if not roll_number:
+            return Response({"error": "Roll number is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Search for student (case insensitive match on roll number)
+        student = StudentProfile.objects.filter(roll_number__iexact=roll_number.strip()).first()
+        if not student:
+            return Response({"error": "Student record not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response(
+            {
+                "message": "Student found.",
+                "student_id": student.id,
+                "roll_number": student.roll_number,
+                "first_name": student.first_name,
+                "last_name": student.last_name,
+                "department": student.department,
+                "session": student.session,
+                "face_image_url": student.face_image_url,
+                "face_registered": student.face_registered,
+                "blocked": student.blocked
+            },
+            status=status.HTTP_200_OK
+        )
+
+from django.utils import timezone
+from services.face_service import FaceService
+
+class VerifyLiveFaceView(APIView):
+    """
+    Endpoint for verifying a live captured face against the student's registered face.
+    Does not mark attendance, only verifies identity.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        roll_number = request.data.get('roll_number')
+        image_file = request.FILES.get('image')
+
+        if not roll_number or not image_file:
+            return Response(
+                {"error": "Roll number and Live face image are required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        student = StudentProfile.objects.filter(roll_number__iexact=roll_number.strip()).first()
+        if not student:
+            return Response({"error": "Student record not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if student.blocked:
+            return Response({"error": "Access Blocked. Please contact the administrator."}, status=status.HTTP_403_FORBIDDEN)
+
+        # Check if temporarily blocked
+        if student.attendance_blocked_until and student.attendance_blocked_until > timezone.now():
+            time_left = int((student.attendance_blocked_until - timezone.now()).total_seconds() / 60)
+            return Response(
+                {"error": f"Identity verification temporarily blocked due to multiple failures. Try again in {time_left} minutes."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS
+            )
+
+        if not student.face_registered or not student.face_encoding:
+            return Response(
+                {"error": "No face template registered for this account."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        live_encoding = FaceService.get_face_encoding(image_file)
+        if not live_encoding:
+            return Response(
+                {"error": "No face detected in live captured image. Make sure your face is clearly visible."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # 1-to-1 match using FaceService
+        _, confidence = FaceService.verify_face(live_encoding, [student.face_encoding], tolerance=0.5)
+
+        # Configurable similarity threshold: 85% (0.85)
+        if confidence < 0.85:
+            # Increment failed attempts
+            student.attendance_failed_attempts += 1
+            if student.attendance_failed_attempts >= 3:
+                student.attendance_blocked_until = timezone.now() + timezone.timedelta(minutes=15)
+                student.attendance_failed_attempts = 0
+                student.save()
+                return Response(
+                    {"error": "Face Verification Failed. 3 failed attempts recorded. Access blocked for 15 minutes."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            student.save()
+            attempts_left = 3 - student.attendance_failed_attempts
+            return Response(
+                {
+                    "error": "Face mismatch. Identity could not be verified.",
+                    "score": round(confidence, 4),
+                    "attempts_left": attempts_left
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Reset failed attempts on success
+        student.attendance_failed_attempts = 0
+        student.save()
+
+        return Response(
+            {
+                "message": "Face Verification Successful",
+                "match": True,
+                "score": round(confidence, 4)
+            },
+            status=status.HTTP_200_OK
+        )

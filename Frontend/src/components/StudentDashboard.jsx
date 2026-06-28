@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../context/AuthContext';
 import apiClient from '../api/client';
-import { Html5QrcodeScanner } from 'html5-qrcode';
+import { Html5Qrcode } from 'html5-qrcode';
 import { User, QrCode, FileText, Camera, UploadCloud, CheckCircle, AlertTriangle, RefreshCw, Clipboard, Video, CheckCircle2, XCircle } from 'lucide-react';
 
 const StudentDashboard = () => {
@@ -30,6 +30,13 @@ const StudentDashboard = () => {
   const [submittingAttendance, setSubmittingAttendance] = useState(false);
   const [attendanceAttemptsLeft, setAttendanceAttemptsLeft] = useState(3);
   const [cameraActive, setCameraActive] = useState(false);
+  const [isCameraStarting, setIsCameraStarting] = useState(false);
+  const [isQrValidating, setIsQrValidating] = useState(false);
+  const [gateDetails, setGateDetails] = useState(null);
+  const [isVerifyingRoll, setIsVerifyingRoll] = useState(false);
+  const [verifiedStudentProfile, setVerifiedStudentProfile] = useState(null);
+  const [isFaceVerified, setIsFaceVerified] = useState(false);
+  const [isVerifyingFace, setIsVerifyingFace] = useState(false);
 
   const scannerRef = useRef(null);
   const videoRef = useRef(null);
@@ -69,66 +76,106 @@ const StudentDashboard = () => {
   useEffect(() => {
     // Clear scanner and camera on tab switch
     if (scannerRef.current) {
-      scannerRef.current.clear().catch(err => console.error(err));
+      scannerRef.current.stop().then(() => {
+        scannerRef.current.clear();
+      }).catch(err => console.error(err));
       scannerRef.current = null;
     }
     stopWebcam();
     setAttendanceError('');
   }, [activeTab]);
 
-  const startQrScanner = () => {
+  const startQrScanner = async () => {
     setAttendanceError('');
-    setTimeout(() => {
-      try {
-        const scanner = new Html5QrcodeScanner("qr-reader-student", {
+    setIsCameraStarting(true);
+    try {
+      const html5QrCode = new Html5Qrcode("qr-reader-student");
+      
+      await html5QrCode.start(
+        { facingMode: "environment" },
+        {
           fps: 10,
           qrbox: { width: 250, height: 250 },
-        }, false);
-        
-        scanner.render(
-          (decodedText) => {
-            handleQrCodeScanned(decodedText);
-          },
-          (errorMessage) => {
-            // frame log silent
-          }
-        );
-        scannerRef.current = scanner;
-      } catch (err) {
-        console.error("Scanner init error:", err);
-      }
-    }, 100);
+        },
+        (decodedText) => {
+          handleQrCodeScanned(decodedText);
+        },
+        (errorMessage) => {
+          // silent parsing errors
+        }
+      );
+      scannerRef.current = html5QrCode;
+    } catch (err) {
+      console.error("Scanner init error:", err);
+      setAttendanceError("Failed to access camera. Please check browser permissions.");
+    } finally {
+      setIsCameraStarting(false);
+    }
   };
 
-  const handleQrCodeScanned = (tokenText) => {
+  const handleQrCodeScanned = async (tokenText) => {
     if (scannerRef.current) {
-      scannerRef.current.clear().catch(err => console.error(err));
+      scannerRef.current.stop().then(() => {
+        scannerRef.current.clear();
+      }).catch(err => console.error(err));
       scannerRef.current = null;
     }
     setScannedToken(tokenText);
-    setAttendanceStep(2);
+    await validateGateQr(tokenText);
   };
 
-  const handleTokenInputSubmit = (e) => {
+  const handleTokenInputSubmit = async (e) => {
     e.preventDefault();
     if (!scannedToken.trim()) {
       setAttendanceError("Please enter a valid token.");
       return;
     }
-    setAttendanceStep(2);
+    await validateGateQr(scannedToken);
   };
 
-  const handleVerifyRoll = () => {
+  const validateGateQr = async (token) => {
+    setIsQrValidating(true);
+    setAttendanceError('');
+    try {
+      const response = await apiClient.post('/qr/daily/validate/', { token });
+      setGateDetails(response.data);
+      setAttendanceStep(2);
+    } catch (err) {
+      setAttendanceError(err.response?.data?.error || "Invalid QR Code. Validation failed.");
+    } finally {
+      setIsQrValidating(false);
+    }
+  };
+
+  const handleVerifyRoll = async () => {
     if (!studentRoll.trim()) {
       setAttendanceError("Please enter your roll number.");
       return;
     }
-    if (studentRoll.trim() !== profile?.roll_number) {
-      setAttendanceError("❌ Invalid Roll Number");
-      return;
-    }
+    setIsVerifyingRoll(true);
     setAttendanceError('');
-    setAttendanceStep(3);
+    try {
+      const response = await apiClient.post('/students/verify-roll/', { roll_number: studentRoll });
+      
+      if (response.data.blocked) {
+        setAttendanceError("Student access is blocked.");
+        return;
+      }
+
+      if (!response.data.face_registered) {
+        alert("Biometric registration required. Redirecting to Face Registration...");
+        setActiveTab('face');
+        resetAttendanceFlow();
+        return;
+      }
+
+      setVerifiedStudentProfile(response.data);
+      setAttendanceStep(3);
+    } catch (err) {
+      setAttendanceError(err.response?.data?.error || "Student record not found.");
+    } finally {
+      setIsVerifyingRoll(false);
+    }
   };
 
   const startWebcam = async () => {
@@ -169,6 +216,37 @@ const StudentDashboard = () => {
       setCapturedFaceFile(file);
       setCapturedFacePreview(URL.createObjectURL(file));
       setAttendanceError('');
+      setIsFaceVerified(false);
+    }
+  };
+
+  const handleFaceVerification = async () => {
+    if (!capturedFaceFile) {
+      setAttendanceError("Please capture your face or select an image file first.");
+      return;
+    }
+
+    setIsVerifyingFace(true);
+    setAttendanceError('');
+
+    const formData = new FormData();
+    formData.append('roll_number', studentRoll);
+    formData.append('image', capturedFaceFile);
+
+    try {
+      const response = await apiClient.post('/students/verify-face/', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      setIsFaceVerified(true);
+    } catch (err) {
+      const errData = err.response?.data;
+      if (errData?.attempts_left !== undefined) {
+        setAttendanceAttemptsLeft(errData.attempts_left);
+      }
+      setAttendanceError(errData?.error || 'Face verification failed.');
+      setIsFaceVerified(false);
+    } finally {
+      setIsVerifyingFace(false);
     }
   };
 
@@ -216,6 +294,9 @@ const StudentDashboard = () => {
     setCapturedFacePreview(null);
     setAttendanceResult(null);
     setAttendanceError('');
+    setGateDetails(null);
+    setVerifiedStudentProfile(null);
+    setIsFaceVerified(false);
   };
 
   const handleFileChange = (e) => {
@@ -624,8 +705,8 @@ const StudentDashboard = () => {
               </div>
 
               {attendanceError && (
-                <div className="bg-red-50 border border-red-200 text-red-655 rounded-xl p-4 flex items-start space-x-2 text-sm text-red-750">
-                  <AlertTriangle className="h-5 w-5 shrink-0 mt-0.5 text-red-550" />
+                <div className="bg-red-50 border border-red-200 text-red-700 rounded-xl p-4 flex items-start space-x-2 text-sm">
+                  <AlertTriangle className="h-5 w-5 shrink-0 mt-0.5 text-red-500" />
                   <span className="font-semibold">{attendanceError}</span>
                 </div>
               )}
@@ -644,9 +725,11 @@ const StudentDashboard = () => {
                     {!scannerRef.current && (
                       <button
                         onClick={startQrScanner}
-                        className="mt-4 bg-blue-50 text-blue-600 hover:bg-blue-100 border border-blue-200 font-semibold px-6 py-2.5 rounded-xl text-sm transition-all"
+                        disabled={isCameraStarting}
+                        className="mt-4 bg-blue-50 text-blue-600 hover:bg-blue-100 disabled:bg-slate-100 disabled:text-slate-400 border border-blue-200 font-semibold px-6 py-2.5 rounded-xl text-sm transition-all flex items-center justify-center gap-2 mx-auto"
                       >
-                        Launch Camera Scanner
+                        {isCameraStarting ? <RefreshCw className="animate-spin h-4 w-4" /> : <Camera className="h-4 w-4" />}
+                        {isCameraStarting ? 'Accessing Camera...' : 'Launch Camera Scanner'}
                       </button>
                     )}
                   </div>
@@ -663,9 +746,10 @@ const StudentDashboard = () => {
                       />
                       <button
                         type="submit"
-                        disabled={!scannedToken}
-                        className="bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white font-semibold px-4 rounded-xl text-xs transition-all"
+                        disabled={!scannedToken || isQrValidating}
+                        className="bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white font-semibold px-4 rounded-xl text-xs transition-all flex items-center gap-1"
                       >
+                        {isQrValidating ? <RefreshCw className="animate-spin h-4 w-4" /> : null}
                         Submit Token
                       </button>
                     </div>
@@ -707,8 +791,10 @@ const StudentDashboard = () => {
                       </button>
                       <button
                         onClick={handleVerifyRoll}
-                        className="w-2/3 bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2.5 rounded-xl text-xs transition-all"
+                        disabled={isVerifyingRoll}
+                        className="w-2/3 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white font-semibold py-2.5 rounded-xl text-xs transition-all flex justify-center items-center gap-2"
                       >
+                        {isVerifyingRoll ? <RefreshCw className="animate-spin h-4 w-4" /> : null}
                         Verify Roll Number
                       </button>
                     </div>
@@ -720,9 +806,30 @@ const StudentDashboard = () => {
               {attendanceStep === 3 && (
                 <div className="space-y-6 max-w-md mx-auto">
                   <div className="text-center space-y-2">
-                    <h4 className="font-bold text-slate-700 text-base">Step 3: Face Verification Capture</h4>
-                    <p className="text-xs text-slate-400">Capture a live snapshot using your front camera to confirm your identity.</p>
+                    <h4 className="font-bold text-slate-700 text-base">Step 3: Face Verification</h4>
+                    <p className="text-xs text-slate-400">Review your details and capture a live snapshot to confirm your identity.</p>
                   </div>
+
+                  {verifiedStudentProfile && (
+                    <div className="bg-white border border-slate-200 shadow-sm rounded-2xl p-4 flex items-center space-x-4">
+                      {verifiedStudentProfile.face_image_url ? (
+                        <img src={verifiedStudentProfile.face_image_url} alt="Registered Face" className="h-16 w-16 rounded-full object-cover border-2 border-blue-500 shadow-sm" />
+                      ) : (
+                        <div className="h-16 w-16 rounded-full bg-slate-100 border-2 border-slate-200 flex items-center justify-center">
+                          <User className="h-8 w-8 text-slate-400" />
+                        </div>
+                      )}
+                      <div>
+                        <h5 className="font-bold text-slate-800 text-sm">
+                          {verifiedStudentProfile.first_name ? `${verifiedStudentProfile.first_name} ${verifiedStudentProfile.last_name}` : verifiedStudentProfile.roll_number}
+                        </h5>
+                        <p className="text-xs font-mono text-slate-500 font-semibold">{verifiedStudentProfile.roll_number}</p>
+                        <p className="text-xs text-slate-400 mt-1">
+                          {verifiedStudentProfile.department || 'No Dept'} | {verifiedStudentProfile.session || 'No Session'}
+                        </p>
+                      </div>
+                    </div>
+                  )}
 
                   <div className="relative border border-slate-200 bg-slate-900 rounded-2xl overflow-hidden min-h-[260px] flex items-center justify-center">
                     {capturedFacePreview ? (
@@ -778,28 +885,36 @@ const StudentDashboard = () => {
 
                     <div className="flex gap-3 pt-2">
                       <button
-                        onClick={() => { stopWebcam(); setAttendanceStep(2); }}
+                        onClick={() => { stopWebcam(); setAttendanceStep(2); setIsFaceVerified(false); }}
                         className="w-1/3 border border-slate-200 hover:bg-slate-50 text-slate-600 font-semibold py-2.5 rounded-xl text-xs transition-all"
                       >
                         Back
                       </button>
-                      <button
-                        onClick={handleAttendanceSubmit}
-                        disabled={submittingAttendance || !capturedFaceFile}
-                        className="w-2/3 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-200 disabled:text-slate-400 text-white font-semibold py-2.5 rounded-xl text-xs transition-all flex items-center justify-center"
-                      >
-                        {submittingAttendance ? (
-                          <>
-                            <RefreshCw className="animate-spin h-4 w-4 mr-2" /> Matching Face Encodings...
-                          </>
-                        ) : (
-                          'Submit Attendance'
-                        )}
-                      </button>
+                      
+                      {!isFaceVerified ? (
+                        <button
+                          onClick={handleFaceVerification}
+                          disabled={isVerifyingFace || !capturedFaceFile}
+                          className="w-2/3 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-200 disabled:text-slate-400 text-white font-semibold py-2.5 rounded-xl text-xs transition-all flex items-center justify-center gap-2"
+                        >
+                          {isVerifyingFace ? <RefreshCw className="animate-spin h-4 w-4" /> : null}
+                          Verify Identity
+                        </button>
+                      ) : (
+                        <button
+                          onClick={handleAttendanceSubmit}
+                          disabled={submittingAttendance}
+                          className="w-2/3 bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-200 disabled:text-slate-400 text-white font-semibold py-2.5 rounded-xl text-xs transition-all flex items-center justify-center gap-2"
+                        >
+                          {submittingAttendance ? <RefreshCw className="animate-spin h-4 w-4" /> : null}
+                          Mark Present
+                        </button>
+                      )}
                     </div>
                   </div>
                 </div>
               )}
+
 
               {/* STEP 4: VERIFICATION RESULT */}
               {attendanceStep === 4 && attendanceResult && (

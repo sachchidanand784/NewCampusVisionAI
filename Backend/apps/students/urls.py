@@ -4,7 +4,9 @@ from .views import (
     RegisterFaceView,
     StudentListView,
     StudentDetailView,
-    StudentResetView
+    StudentResetView,
+    VerifyRollNumberView,
+    VerifyLiveFaceView
 )
 
 urlpatterns = [
@@ -13,4 +15,6 @@ urlpatterns = [
     path('', StudentListView.as_view(), name='student_list'),
     path('<int:pk>/', StudentDetailView.as_view(), name='student_detail'),
     path('reset/<int:pk>/', StudentResetView.as_view(), name='student_reset'),
+    path('verify-roll/', VerifyRollNumberView.as_view(), name='verify_roll'),
+    path('verify-face/', VerifyLiveFaceView.as_view(), name='verify_face'),
 ]

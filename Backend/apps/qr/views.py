@@ -180,3 +180,43 @@ class ActiveDailyQrView(APIView):
             },
             status=status.HTTP_200_OK
         )
+
+class ValidateDailyQrTokenView(APIView):
+    """
+    Endpoint for validating the Daily QR Token before starting attendance flow.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        token = request.data.get('token')
+        if not token:
+            return Response({"error": "QR token is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # 1. Verify crypto signature
+        payload = QrService.verify_daily_qr_token(token)
+        if not payload:
+            return Response({"error": "Invalid or expired QR token signature."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # 2. Check Database for Active DailyQR
+        daily_qr = DailyQR.objects.filter(token=token, is_active=True).first()
+        if not daily_qr:
+            return Response({"error": "This QR token is inactive, expired, or invalid."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # 3. Check Date
+        today = timezone.localdate()
+        if daily_qr.date != today:
+            daily_qr.is_active = False
+            daily_qr.save()
+            return Response({"error": "This QR token is from a past date and has expired."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # 4. Return Gate Info
+        return Response(
+            {
+                "message": "QR Validated",
+                "gate_id": daily_qr.generated_by.id,
+                "gate_name": daily_qr.generated_by.get_full_name() or daily_qr.generated_by.username,
+                "qr_type": daily_qr.qr_type,
+                "timestamp": daily_qr.created_at.isoformat(),
+            },
+            status=status.HTTP_200_OK
+        )
